@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -279,11 +281,16 @@ type App struct {
 // 决定。任何"是否入队 preview worker"的判断都应通过这个方法读，避免把状态
 // 散落到 App 内存里和 DB 不一致。
 //
-// 读 catalog 失败时退化成 false（不生成）：比 "默认开" 更安全 —— 读不到状态时
-// 倾向不消耗 ffmpeg；调用方会记日志，运维能立刻看到问题。
+// local-upload 是内置盘，不一定有 catalog.drives 行；缺省按开启处理。
+//
+// 其它 drive 读 catalog 失败时退化成 false（不生成）：比 "默认开" 更安全 —— 读不到
+// 状态时倾向不消耗 ffmpeg；调用方会记日志，运维能立刻看到问题。
 func (a *App) teaserEnabledForDrive(ctx context.Context, driveID string) bool {
 	d, err := a.cat.GetDrive(ctx, driveID)
 	if err != nil {
+		if driveID == localupload.DriveID && errors.Is(err, sql.ErrNoRows) {
+			return true
+		}
 		log.Printf("[preview] read teaser_enabled drive=%s: %v (treating as disabled)", driveID, err)
 		return false
 	}

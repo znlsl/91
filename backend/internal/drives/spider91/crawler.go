@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -113,7 +114,7 @@ type CrawlResult struct {
 	Skipped int
 	// Failed 是下载或入库失败的条数。
 	Failed int
-	// SeenSnapshot 调用 Python 时实际写出的已知 viewkey 数量。
+	// SeenSnapshot 调用 Python 时实际写出的已知视频 ID 数量。
 	SeenSnapshot int
 	StartedAt    time.Time
 	FinishedAt   time.Time
@@ -127,11 +128,12 @@ type spiderVideoEntry struct {
 	ThumbURL  string `json:"thumb_url"`
 	VideoURL  string `json:"video_url"`
 	Viewkey   string `json:"viewkey"`
+	SourceID  string `json:"source_id"`
 	DetailURL string `json:"detail_url"`
 }
 
 // RunOnce 执行一次"跑爬虫 → 下载 → 入库"流程：
-//  1. 从 catalog 拉取本 drive 已存在的 viewkey 列表，写到临时文件
+//  1. 从 catalog 拉取本 drive 已存在的 91 源视频 ID 列表，写到临时文件
 //  2. 启动 Python 爬虫（--target-new + --seen-viewkeys-file + --stream-output），
 //     Python 每解析出一个 video 直链就把 entry 当作一行 JSON 写到 stdout。
 //  3. Go 端 bufio.Scanner 按行读：每行立即下载视频和封面、入库。
@@ -168,7 +170,7 @@ func (c *Crawler) RunOnce(ctx context.Context, targetNew int) (*CrawlResult, err
 	result := &CrawlResult{TargetNew: targetNew, StartedAt: time.Now()}
 	defer func() { result.FinishedAt = time.Now() }()
 
-	// 1. 准备 .crawl/ 目录 + 已知 viewkey 列表
+	// 1. 准备 .crawl/ 目录 + 已知源视频 ID 列表
 	//
 	// 关键：路径必须用绝对路径，因为 Python 子进程的 cwd 我们设成了脚本所在目录
 	// （为了让 Python 用 site-packages 里的 requests 等），传相对路径会被 Python
@@ -222,8 +224,8 @@ func (c *Crawler) RunOnce(ctx context.Context, targetNew int) (*CrawlResult, err
 			continue
 		}
 		result.TotalEntries++
-		viewkey := strings.TrimSpace(item.Viewkey)
-		if viewkey == "" || strings.TrimSpace(item.VideoURL) == "" {
+		sourceID := sourceIDForItem(item)
+		if sourceID == "" || strings.TrimSpace(item.VideoURL) == "" {
 			result.Failed++
 			continue
 		}
@@ -231,13 +233,13 @@ func (c *Crawler) RunOnce(ctx context.Context, targetNew int) (*CrawlResult, err
 			// Python 侧已用 target_new 控制；这里再兜底防止脚本异常多输出
 			break
 		}
-		videoID := buildVideoID(c.cfg.Driver.ID(), viewkey)
+		videoID := buildVideoID(c.cfg.Driver.ID(), sourceID)
 		if existing, _ := c.cfg.Catalog.GetVideo(ctx, videoID); existing != nil {
 			result.Skipped++
 			continue
 		}
 		if perr := c.processOne(ctx, videoID, item); perr != nil {
-			log.Printf("[spider91] drive=%s viewkey=%s failed: %v", c.cfg.Driver.ID(), viewkey, perr)
+			log.Printf("[spider91] drive=%s viewkey=%s source_id=%s failed: %v", c.cfg.Driver.ID(), item.Viewkey, sourceID, perr)
 			result.Failed++
 			continue
 		}
@@ -256,24 +258,24 @@ func (c *Crawler) RunOnce(ctx context.Context, targetNew int) (*CrawlResult, err
 	return result, nil
 }
 
-// writeSeenViewkeys 把当前 drive 下已入库的 viewkey 写到 path，供 Python 脚本读取。
+// writeSeenViewkeys 把当前 drive 下已入库的 91 源视频 ID 写到 path，供 Python 脚本读取。
 //
 // 注意：不能用 ListVideoFileIDsByDrive（按 drive_id 查），因为 spider91
 // 视频被 spider91migrate 迁移到 PikPak 后 drive_id 已经不再是这个 drive。
 // 改用 ListSpider91Viewkeys：它按 video.id 前缀（"spider91-<driveID>-"）查，
-// 不受迁移影响——id 永远是 spider91-<driveID>-<viewkey>。
+// 不受迁移影响。函数名保留历史叫法，实际返回的是 ID 后缀；新数据使用 mp4 源 ID。
 func (c *Crawler) writeSeenViewkeys(ctx context.Context, path string) (int, error) {
-	viewkeys, err := c.cfg.Catalog.ListSpider91Viewkeys(ctx, c.cfg.Driver.ID())
+	seenIDs, err := c.cfg.Catalog.ListSpider91Viewkeys(ctx, c.cfg.Driver.ID())
 	if err != nil {
 		return 0, err
 	}
-	seen := make(map[string]struct{}, len(viewkeys))
-	for _, vk := range viewkeys {
-		vk = strings.TrimSpace(vk)
-		if vk == "" {
+	seen := make(map[string]struct{}, len(seenIDs))
+	for _, id := range seenIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
 			continue
 		}
-		seen[vk] = struct{}{}
+		seen[id] = struct{}{}
 	}
 
 	tmp := path + ".part"
@@ -281,8 +283,8 @@ func (c *Crawler) writeSeenViewkeys(ctx context.Context, path string) (int, erro
 	if err != nil {
 		return 0, err
 	}
-	for viewkey := range seen {
-		if _, err := f.WriteString(viewkey + "\n"); err != nil {
+	for id := range seen {
+		if _, err := f.WriteString(id + "\n"); err != nil {
 			_ = f.Close()
 			_ = os.Remove(tmp)
 			return 0, err
@@ -356,15 +358,30 @@ func forwardSpiderLog(driveID string, r io.Reader) {
 	}
 }
 
-// processOne 处理单个 viewkey：下载视频 + 封面 + 复制封面 + 入库。
+// processOne 处理单个 91 源视频：下载视频 + 封面 + 复制封面 + 入库。
 // 任一步失败会清理已写入的临时文件，不留半成品。
 func (c *Crawler) processOne(ctx context.Context, videoID string, item spiderVideoEntry) error {
 	viewkey := item.Viewkey
+	sourceID := sourceIDForItem(item)
+	if sourceID == "" {
+		return errors.New("empty numeric source id")
+	}
+
+	videoURL := strings.TrimSpace(item.VideoURL)
+	videoSourceID := sourceIDFromVideoURL(videoURL)
+	if videoSourceID == "" {
+		return fmt.Errorf("video url has no numeric source id: %s", videoURL)
+	}
+	if videoSourceID != sourceID {
+		return fmt.Errorf("video source id mismatch: got %s want %s", videoSourceID, sourceID)
+	}
+	thumbURL := normalizeThumbURLForSource(item.ThumbURL, sourceID)
+
 	// 视频文件后缀按直链 URL 真实后缀来定，避免直链返回的不是 mp4 时存错容器。
-	videoExt := detectVideoExt(item.VideoURL)
-	videoFile := viewkey + videoExt
+	videoExt := detectVideoExt(videoURL)
+	videoFile := sourceID + videoExt
 	// 封面后缀同理，但 91porn 的封面绝大多数是 jpg；URL 提示其它格式时尊重之。
-	thumbFile := viewkey + detectThumbExt(item.ThumbURL)
+	thumbFile := sourceID + detectThumbExt(thumbURL)
 
 	videoPath, err := c.cfg.Driver.VideoPath(videoFile)
 	if err != nil {
@@ -376,10 +393,7 @@ func (c *Crawler) processOne(ctx context.Context, videoID string, item spiderVid
 	}
 
 	// 视频先下载（必须）；失败直接退出。
-	dlCtx, cancel := context.WithTimeout(ctx, c.cfg.DownloadTimeout)
-	defer cancel()
-
-	videoSize, err := c.downloadAtomic(dlCtx, item.VideoURL, videoPath, item.DetailURL)
+	videoSize, err := c.downloadVideoAtomicWithRefresh(ctx, item, videoPath, videoURL, sourceID)
 	if err != nil {
 		return fmt.Errorf("download video: %w", err)
 	}
@@ -388,9 +402,12 @@ func (c *Crawler) processOne(ctx context.Context, videoID string, item spiderVid
 	// thumbnail_status 显式标 'failed'（spider91 drive 的 thumb worker 按设计
 	// 不处理 spider91 视频，没人能"兜底"）。
 	thumbReady := false
-	if strings.TrimSpace(item.ThumbURL) != "" {
-		if _, err := c.downloadAtomic(dlCtx, item.ThumbURL, thumbPath, item.DetailURL); err != nil {
-			log.Printf("[spider91] drive=%s viewkey=%s thumb download failed: %v", c.cfg.Driver.ID(), viewkey, err)
+	if strings.TrimSpace(thumbURL) != "" {
+		thumbCtx, cancel := c.downloadAttemptContext(ctx)
+		_, err := c.downloadAtomic(thumbCtx, thumbURL, thumbPath, item.DetailURL)
+		cancel()
+		if err != nil {
+			log.Printf("[spider91] drive=%s viewkey=%s source_id=%s thumb download failed: %v", c.cfg.Driver.ID(), viewkey, sourceID, err)
 		} else {
 			thumbReady = true
 		}
@@ -404,7 +421,7 @@ func (c *Crawler) processOne(ctx context.Context, videoID string, item spiderVid
 		} else {
 			dst := filepath.Join(c.cfg.CommonThumbDir, videoID+".jpg")
 			if err := copyFileAtomic(thumbPath, dst); err != nil {
-				log.Printf("[spider91] drive=%s viewkey=%s copy thumb to common dir: %v", c.cfg.Driver.ID(), viewkey, err)
+				log.Printf("[spider91] drive=%s viewkey=%s source_id=%s copy thumb to common dir: %v", c.cfg.Driver.ID(), viewkey, sourceID, err)
 				thumbReady = false
 			}
 		}
@@ -429,7 +446,7 @@ func (c *Crawler) processOne(ctx context.Context, videoID string, item spiderVid
 		UpdatedAt:     now,
 	}
 	if v.Title == "" {
-		v.Title = viewkey
+		v.Title = sourceID
 	}
 	if thumbReady {
 		// 设了 ThumbnailURL 后 thumb worker 会跳过这条视频，
@@ -455,8 +472,54 @@ func (c *Crawler) processOne(ctx context.Context, videoID string, item spiderVid
 	if c.cfg.OnNewVideo != nil {
 		c.cfg.OnNewVideo(v)
 	}
-	log.Printf("[spider91] drive=%s viewkey=%s ok title=%q size=%d", c.cfg.Driver.ID(), viewkey, v.Title, v.Size)
+	log.Printf("[spider91] drive=%s viewkey=%s source_id=%s ok title=%q size=%d", c.cfg.Driver.ID(), viewkey, sourceID, v.Title, v.Size)
 	return nil
+}
+
+func (c *Crawler) downloadVideoAtomicWithRefresh(ctx context.Context, item spiderVideoEntry, dst, firstURL, expectedSourceID string) (int64, error) {
+	videoURL := strings.TrimSpace(firstURL)
+	if videoURL == "" {
+		videoURL = strings.TrimSpace(item.VideoURL)
+	}
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		attemptCtx, cancel := c.downloadAttemptContext(ctx)
+		size, err := c.downloadAtomic(attemptCtx, videoURL, dst, item.DetailURL)
+		cancel()
+		if err == nil {
+			return size, nil
+		}
+		lastErr = err
+		if ctx.Err() != nil || !shouldRefreshSpider91VideoURL(err) {
+			return 0, err
+		}
+		fresh, refreshErr := c.resolveFreshVideoURL(ctx, item)
+		if refreshErr != nil {
+			return 0, fmt.Errorf("%w; refresh video url: %v", err, refreshErr)
+		}
+		if fresh == "" || fresh == videoURL {
+			return 0, err
+		}
+		freshSourceID := sourceIDFromVideoURL(fresh)
+		if freshSourceID == "" {
+			return 0, fmt.Errorf("%w; refreshed video url has no numeric source id: %s", err, fresh)
+		}
+		if expectedSourceID != "" && freshSourceID != expectedSourceID {
+			return 0, fmt.Errorf("%w; refreshed video source id mismatch: got %s want %s", err, freshSourceID, expectedSourceID)
+		}
+		_ = os.Remove(dst + ".part")
+		log.Printf("[spider91] drive=%s viewkey=%s source_id=%s download attempt=%d failed (%v); refreshed video url and retrying",
+			c.cfg.Driver.ID(), item.Viewkey, expectedSourceID, attempt, err)
+		videoURL = fresh
+	}
+	return 0, lastErr
+}
+
+func (c *Crawler) downloadAttemptContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if c.cfg.DownloadTimeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, c.cfg.DownloadTimeout)
 }
 
 // downloadAtomic 下载 url 到 dst，先写到 dst.part 再 rename，避免半截文件。
@@ -487,7 +550,7 @@ func (c *Crawler) downloadAtomic(ctx context.Context, src, dst, referer string) 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return 0, fmt.Errorf("http %d", resp.StatusCode)
+		return 0, &downloadHTTPError{StatusCode: resp.StatusCode}
 	}
 
 	tmp := dst + ".part"
@@ -514,6 +577,289 @@ func (c *Crawler) downloadAtomic(ctx context.Context, src, dst, referer string) 
 		return 0, err
 	}
 	return written, nil
+}
+
+type downloadHTTPError struct {
+	StatusCode int
+}
+
+func (e *downloadHTTPError) Error() string {
+	if e == nil {
+		return "http error"
+	}
+	return fmt.Sprintf("http %d", e.StatusCode)
+}
+
+func shouldRefreshSpider91VideoURL(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var httpErr *downloadHTTPError
+	if errors.As(err, &httpErr) {
+		switch httpErr.StatusCode {
+		case http.StatusForbidden, http.StatusNotFound, http.StatusGone, http.StatusRequestedRangeNotSatisfiable,
+			http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			return true
+		default:
+			return false
+		}
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "unexpected eof") ||
+		strings.Contains(text, "connection reset") ||
+		strings.Contains(text, "connection refused") ||
+		strings.Contains(text, "broken pipe") ||
+		strings.Contains(text, "server closed") ||
+		strings.Contains(text, "timeout")
+}
+
+func (c *Crawler) resolveFreshVideoURL(ctx context.Context, item spiderVideoEntry) (string, error) {
+	detailURL := strings.TrimSpace(item.DetailURL)
+	if detailURL == "" {
+		return "", errors.New("empty detail url")
+	}
+	cookieHeader := "mode=d"
+	if warmURL := spider91ListURLForDetail(detailURL); warmURL != "" {
+		if cookies, err := c.fetchSpider91WarmCookies(ctx, warmURL, detailURL); err == nil {
+			cookieHeader = spider91CookieHeader(cookies)
+		} else {
+			log.Printf("[spider91] drive=%s viewkey=%s warm session failed: %v", c.cfg.Driver.ID(), item.Viewkey, err)
+		}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, detailURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", downloadUA)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
+	req.Header.Set("Cookie", cookieHeader)
+	resp, err := c.cfg.HTTPClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", &downloadHTTPError{StatusCode: resp.StatusCode}
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
+	if err != nil {
+		return "", err
+	}
+	videoURL := parseSpider91VideoURL(string(body))
+	if videoURL == "" {
+		return "", errors.New("video url not found in detail page")
+	}
+	return videoURL, nil
+}
+
+func (c *Crawler) fetchSpider91WarmCookies(ctx context.Context, warmURL, referer string) ([]*http.Cookie, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, warmURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", downloadUA)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
+	req.Header.Set("Cookie", "mode=d")
+	if referer != "" {
+		req.Header.Set("Referer", referer)
+	}
+	resp, err := c.cfg.HTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64*1024))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, &downloadHTTPError{StatusCode: resp.StatusCode}
+	}
+	return resp.Cookies(), nil
+}
+
+func spider91ListURLForDetail(detailURL string) string {
+	u, err := url.Parse(strings.TrimSpace(detailURL))
+	if err != nil || u == nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	if !strings.Contains(strings.ToLower(u.Host), "91porn.com") {
+		return ""
+	}
+	q := u.Query()
+	page := strings.TrimSpace(q.Get("page"))
+	category := strings.TrimSpace(q.Get("category"))
+	viewtype := strings.TrimSpace(q.Get("viewtype"))
+	if page == "" || category == "" || viewtype == "" {
+		return ""
+	}
+	listURL := *u
+	listURL.Path = "/v.php"
+	listQuery := url.Values{}
+	listQuery.Set("category", category)
+	listQuery.Set("viewtype", viewtype)
+	listQuery.Set("page", page)
+	listURL.RawQuery = listQuery.Encode()
+	listURL.Fragment = ""
+	return listURL.String()
+}
+
+func spider91CookieHeader(cookies []*http.Cookie) string {
+	values := []string{"mode=d"}
+	seen := map[string]bool{"mode": true}
+	for _, cookie := range cookies {
+		if cookie == nil || strings.TrimSpace(cookie.Name) == "" || seen[cookie.Name] {
+			continue
+		}
+		seen[cookie.Name] = true
+		values = append(values, cookie.Name+"="+cookie.Value)
+	}
+	return strings.Join(values, "; ")
+}
+
+var (
+	strencode2RE = regexp.MustCompile(`strencode2\(["']([^"']+)["']\)`)
+	srcAttrRE    = regexp.MustCompile(`src=['"]([^'"]+)['"]`)
+	mp4URLRE     = regexp.MustCompile(`https?://[^\s"'<>]+\.mp4[^\s"'<>]*`)
+)
+
+func parseSpider91VideoURL(html string) string {
+	if html == "" {
+		return ""
+	}
+	if match := strencode2RE.FindStringSubmatch(html); len(match) == 2 {
+		if decoded, err := url.PathUnescape(match[1]); err == nil {
+			if src := srcAttrRE.FindStringSubmatch(decoded); len(src) == 2 {
+				return normalizeHTTPURLSlashes(src[1])
+			}
+		}
+	}
+	if match := mp4URLRE.FindString(html); match != "" {
+		lower := strings.ToLower(match)
+		if !strings.Contains(lower, "kwai") && !strings.Contains(lower, "ad-") {
+			return match
+		}
+	}
+	return ""
+}
+
+func normalizeHTTPURLSlashes(rawURL string) string {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || u == nil || u.Scheme == "" || u.Host == "" {
+		return rawURL
+	}
+	for strings.Contains(u.Path, "//") {
+		u.Path = strings.ReplaceAll(u.Path, "//", "/")
+	}
+	return u.String()
+}
+
+func sourceIDForItem(item spiderVideoEntry) string {
+	if id := sanitizeSourceID(item.SourceID); isNumericSourceID(id) {
+		return id
+	}
+	if id := sourceIDFromVideoURL(item.VideoURL); id != "" {
+		return id
+	}
+	if id := sourceIDFromThumbURL(item.ThumbURL); id != "" {
+		return id
+	}
+	return ""
+}
+
+func sourceIDFromVideoURL(rawURL string) string {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || u == nil {
+		return ""
+	}
+	base := path.Base(u.Path)
+	ext := strings.ToLower(path.Ext(base))
+	switch ext {
+	case ".mp4", ".m4v", ".mov", ".webm", ".mkv", ".avi", ".flv":
+	default:
+		return ""
+	}
+	id := sanitizeSourceID(strings.TrimSuffix(base, ext))
+	if !isNumericSourceID(id) {
+		return ""
+	}
+	return id
+}
+
+func sourceIDFromThumbURL(rawURL string) string {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || u == nil {
+		return ""
+	}
+	base := path.Base(u.Path)
+	ext := strings.ToLower(path.Ext(base))
+	switch ext {
+	case ".jpg", ".jpeg", ".png", ".webp", ".gif":
+	default:
+		return ""
+	}
+	id := sanitizeSourceID(strings.TrimSuffix(base, ext))
+	if !isNumericSourceID(id) {
+		return ""
+	}
+	return id
+}
+
+func sanitizeSourceID(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range raw {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func isNumericSourceID(id string) bool {
+	if id == "" {
+		return false
+	}
+	for _, r := range id {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeThumbURLForSource(rawURL, sourceID string) string {
+	sourceID = sanitizeSourceID(sourceID)
+	if strings.TrimSpace(rawURL) == "" || sourceID == "" {
+		return rawURL
+	}
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || u == nil || u.Scheme == "" || u.Host == "" {
+		return rawURL
+	}
+	base := path.Base(u.Path)
+	ext := strings.ToLower(path.Ext(base))
+	switch ext {
+	case ".jpg", ".jpeg", ".png", ".webp", ".gif":
+	default:
+		return rawURL
+	}
+	dir := path.Dir(u.Path)
+	if dir == "." || dir == "/" || !strings.HasSuffix(dir, "/thumb") {
+		return rawURL
+	}
+	u.Path = path.Join(dir, sourceID+".jpg")
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
 }
 
 // copyFileAtomic 把 src 复制到 dst，先写 .part 再 rename。
@@ -543,14 +889,14 @@ func copyFileAtomic(src, dst string) error {
 	return os.Rename(tmp, dst)
 }
 
-// BuildVideoID 给定 driveID + viewkey，按统一规则生成 catalog 中 videos.id。
+// BuildVideoID 给定 driveID + 91 源视频 ID，按统一规则生成 catalog 中 videos.id。
 // 与 scanner 用法一致：<kind>-<driveID>-<fileID>。
-func BuildVideoID(driveID, viewkey string) string {
-	return buildVideoID(driveID, viewkey)
+func BuildVideoID(driveID, sourceID string) string {
+	return buildVideoID(driveID, sourceID)
 }
 
-func buildVideoID(driveID, viewkey string) string {
-	return Kind + "-" + driveID + "-" + viewkey
+func buildVideoID(driveID, sourceID string) string {
+	return Kind + "-" + driveID + "-" + sourceID
 }
 
 // detectVideoExt 从直链 URL 推断视频文件后缀。

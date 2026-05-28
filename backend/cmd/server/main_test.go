@@ -46,9 +46,9 @@ func TestRegisterPreviewWorkerBackfillsPendingWhenDriveTeaserEnabled(t *testing.
 	}
 
 	app := &App{
-		cat:            cat,
-		workers:        make(map[string]*preview.Worker),
-		thumbWorkers:   make(map[string]*preview.ThumbWorker),
+		cat:          cat,
+		workers:      make(map[string]*preview.Worker),
+		thumbWorkers: make(map[string]*preview.ThumbWorker),
 	}
 	worker := preview.NewWorker(&serverFakeTeaserGenerator{}, cat, &serverFakeDrive{})
 	go worker.Run(ctx)
@@ -106,9 +106,9 @@ func TestRegisterPreviewWorkersGenerateThumbnailsBeforePreviews(t *testing.T) {
 	}
 
 	app := &App{
-		cat:            cat,
-		workers:        make(map[string]*preview.Worker),
-		thumbWorkers:   make(map[string]*preview.ThumbWorker),
+		cat:          cat,
+		workers:      make(map[string]*preview.Worker),
+		thumbWorkers: make(map[string]*preview.ThumbWorker),
 	}
 	gen := &serverFakeTeaserGenerator{}
 	drv := &serverFakeDrive{}
@@ -194,9 +194,9 @@ func TestFailedThumbnailsDoNotBlockPreviewGeneration(t *testing.T) {
 	}
 
 	app := &App{
-		cat:            cat,
-		workers:        make(map[string]*preview.Worker),
-		thumbWorkers:   make(map[string]*preview.ThumbWorker),
+		cat:          cat,
+		workers:      make(map[string]*preview.Worker),
+		thumbWorkers: make(map[string]*preview.ThumbWorker),
 	}
 	gen := &serverFakeTeaserGenerator{}
 	drv := &serverFakeDrive{}
@@ -261,9 +261,9 @@ func TestRegenFailedPreviewsQueuesOnlyFailedVideosForDrive(t *testing.T) {
 	}
 
 	app := &App{
-		cat:            cat,
-		workers:        make(map[string]*preview.Worker),
-		thumbWorkers:   make(map[string]*preview.ThumbWorker),
+		cat:          cat,
+		workers:      make(map[string]*preview.Worker),
+		thumbWorkers: make(map[string]*preview.ThumbWorker),
 	}
 	worker := preview.NewWorker(&serverFakeTeaserGenerator{}, cat, &serverFakeDrive{})
 	go worker.Run(ctx)
@@ -311,7 +311,7 @@ func TestRegenFailedPreviewsQueuesOnlyFailedVideosForDrive(t *testing.T) {
 	}
 }
 
-func TestEnqueueUploadedVideoQueuesLocalPreviewWorker(t *testing.T) {
+func TestEnqueueUploadedVideoQueuesLocalGenerationByDefault(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -325,7 +325,6 @@ func TestEnqueueUploadedVideoQueuesLocalPreviewWorker(t *testing.T) {
 		}
 	})
 
-	seedDriveWithTeaser(t, cat, "local-upload", true)
 	video := &catalog.Video{
 		ID:            "local-upload-video",
 		DriveID:       "local-upload",
@@ -341,14 +340,19 @@ func TestEnqueueUploadedVideoQueuesLocalPreviewWorker(t *testing.T) {
 	}
 
 	app := &App{
-		cat:            cat,
-		workers:        make(map[string]*preview.Worker),
-		thumbWorkers:   make(map[string]*preview.ThumbWorker),
+		cat:          cat,
+		workers:      make(map[string]*preview.Worker),
+		thumbWorkers: make(map[string]*preview.ThumbWorker),
 	}
-	worker := preview.NewWorker(&serverFakeTeaserGenerator{}, cat, &serverLocalUploadFakeDrive{})
+	gen := &serverFakeTeaserGenerator{}
+	drv := &serverLocalUploadFakeDrive{}
+	worker := preview.NewWorker(gen, cat, drv)
+	thumbWorker := preview.NewThumbWorker(gen, cat, drv)
 	go worker.Run(ctx)
+	go thumbWorker.Run(ctx)
 	app.mu.Lock()
 	app.workers["local-upload"] = worker
+	app.thumbWorkers["local-upload"] = thumbWorker
 	app.mu.Unlock()
 
 	app.enqueueUploadedVideo(ctx, video)
@@ -359,9 +363,12 @@ func TestEnqueueUploadedVideoQueuesLocalPreviewWorker(t *testing.T) {
 		if err != nil {
 			t.Fatalf("get video: %v", err)
 		}
-		if got.PreviewStatus == "ready" {
+		if got.PreviewStatus == "ready" && got.ThumbnailURL != "" {
 			if got.PreviewLocal != "/tmp/local-upload-video.mp4" {
 				t.Fatalf("preview local = %q, want generated local teaser path", got.PreviewLocal)
+			}
+			if got.ThumbnailURL != "/p/thumb/local-upload-video" {
+				t.Fatalf("thumbnail url = %q, want generated thumbnail URL", got.ThumbnailURL)
 			}
 			return
 		}
@@ -372,7 +379,7 @@ func TestEnqueueUploadedVideoQueuesLocalPreviewWorker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get video after timeout: %v", err)
 	}
-	t.Fatalf("preview status = %q, want ready", got.PreviewStatus)
+	t.Fatalf("preview status = %q, thumbnail url = %q; want generated local teaser and thumbnail", got.PreviewStatus, got.ThumbnailURL)
 }
 
 func TestShouldScanDriveSkipsLocalUpload(t *testing.T) {
@@ -542,7 +549,6 @@ type serverLocalUploadFakeDrive struct {
 }
 
 func (d *serverLocalUploadFakeDrive) ID() string { return "local-upload" }
-
 
 // seedDriveWithTeaser 在 catalog 里 upsert 一个测试用的 drive 行，把 TeaserEnabled
 // 设为 enabled。teaser 入队判断现在按 per-drive 而不是全局 setting，所以涉及到

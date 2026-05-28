@@ -634,8 +634,8 @@ func (s *Server) handleUploadedVideo(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSpider91Video 服务 spider91 drive 下载到本地的视频文件。
-// 路径形如 /p/spider91/<videoID>，videoID = "spider91-<driveID>-<viewkey>"。
-// 通过 catalog 拿到 file_id（"<viewkey>.mp4"），再让 driver 解析到绝对路径并 ServeFile。
+// 路径形如 /p/spider91/<videoID>，videoID = "spider91-<driveID>-<sourceID>"。
+// 通过 catalog 拿到 file_id（"<sourceID>.mp4"），再让 driver 解析到绝对路径并 ServeFile。
 func (s *Server) handleSpider91Video(w http.ResponseWriter, r *http.Request) {
 	videoID := chi.URLParam(r, "videoID")
 	v, err := s.Catalog.GetVideo(r.Context(), videoID)

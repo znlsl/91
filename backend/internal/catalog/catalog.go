@@ -172,7 +172,7 @@ func (c *Catalog) HideVideo(ctx context.Context, id string) error {
 
 // MigrateVideoToDrive 把 catalog 里 id=videoID 这条视频迁移到另一个 drive。
 // 用于 spider91 → PikPak 的迁移：上传成功后改写 drive_id / file_id /
-// content_hash，保留视频自身的 id（spider91-<driveID>-<viewkey>），这样
+// content_hash，保留视频自身的 id（spider91-<driveID>-<sourceID>），这样
 // 关联表 (video_tags / 收藏 / 点赞) 都不需要动。
 //
 // scanner 后续看到 PikPak 目录下相同 hash / file_name 的文件时，会通过
@@ -555,7 +555,7 @@ func (c *Catalog) ListVideosByDrive(ctx context.Context, driveID string) ([]*Vid
 }
 
 // ListVideoFileIDsByDrive 只返回某 drive 下所有视频的 file_id 集合，
-// 比 ListVideosByDrive 轻量，spider91 crawler 用它把已知 viewkey 列表喂给 python 脚本。
+// 比 ListVideosByDrive 轻量。
 func (c *Catalog) ListVideoFileIDsByDrive(ctx context.Context, driveID string) ([]string, error) {
 	rows, err := c.db.QueryContext(ctx,
 		`SELECT file_id FROM videos WHERE drive_id = ? AND file_id != ''`,
@@ -575,16 +575,17 @@ func (c *Catalog) ListVideoFileIDsByDrive(ctx context.Context, driveID string) (
 	return out, rows.Err()
 }
 
-// ListSpider91Viewkeys 列出某个 spider91 drive 历史上爬过的所有 viewkey。
+// ListSpider91Viewkeys 列出某个 spider91 drive 历史上爬过的所有 ID 后缀。
+// 函数名保留历史叫法；新 spider91 数据的后缀是 91 mp4 源 ID，不再是 viewkey。
 //
 // 不能再用 ListVideoFileIDsByDrive：那个只看 drive_id，但 spider91 视频
 // 一旦被 spider91migrate 迁移到 PikPak，drive_id 就变成 PikPak 了。
 //
 // 这里按 video.id 前缀 "spider91-<driveID>-" 查，即使迁移后视频也仍能被
-// 找到——id 本身永远是 "spider91-<driveID>-<viewkey>"。
+// 找到——id 本身会保留 "spider91-<driveID>-<sourceID>" 这个来源前缀。
 //
-// 用途：crawler 把这个集合写到 seen 文件，让 Python 跳过已爬过的 viewkey
-// 详情页，配合 --target-new 真正凑出 N 个未爬过的视频。
+// 用途：crawler 把这个集合写到 seen 文件，让 Python/Go 跳过已爬过的视频，
+// 配合 --target-new 真正凑出 N 个未爬过的视频。
 func (c *Catalog) ListSpider91Viewkeys(ctx context.Context, driveID string) ([]string, error) {
 	prefix := "spider91-" + driveID + "-"
 	rows, err := c.db.QueryContext(ctx,

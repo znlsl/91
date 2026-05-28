@@ -4,7 +4,7 @@
 // 与其它 drive 不同的是：
 //   - 数据来源不是云盘 API，而是 Python 子进程跑 spider_91porn.py 后下载到本地
 //   - StreamURL 直接返回本地文件路径，由 api.handleSpider91Video 用 http.ServeFile 服务
-//   - List/Stat 用于 GC 兜底（按 viewkey 列出 videos/ 目录）
+//   - List/Stat 用于 GC 兜底（按本地文件名列出 videos/ 目录）
 package spider91
 
 import (
@@ -77,12 +77,12 @@ func (d *Driver) ThumbsDir() string { return filepath.Join(d.rootDir, "thumbs") 
 // RootDir 返回 driver 的存储根。
 func (d *Driver) RootDir() string { return d.rootDir }
 
-// VideoPath 返回某个 viewkey 对应的视频文件绝对路径，并校验路径不会逃出 videos/ 目录。
+// VideoPath 返回某个视频文件的绝对路径，并校验路径不会逃出 videos/ 目录。
 func (d *Driver) VideoPath(fileID string) (string, error) {
 	return safeJoin(d.VideosDir(), fileID)
 }
 
-// ThumbPath 返回某个 viewkey 对应的封面文件绝对路径。
+// ThumbPath 返回某个封面文件的绝对路径。
 func (d *Driver) ThumbPath(fileID string) (string, error) {
 	return safeJoin(d.ThumbsDir(), fileID)
 }
@@ -117,7 +117,7 @@ func (d *Driver) List(ctx context.Context, dirID string) ([]drives.Entry, error)
 	return out, nil
 }
 
-// Stat 查询单个 viewkey 视频文件的元数据。
+// Stat 查询单个视频文件的元数据。
 func (d *Driver) Stat(ctx context.Context, fileID string) (*drives.Entry, error) {
 	path, err := d.VideoPath(fileID)
 	if err != nil {
